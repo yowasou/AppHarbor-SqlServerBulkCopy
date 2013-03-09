@@ -7,6 +7,7 @@ using System.Text;
 using Microsoft.SqlServer.Management.Common;
 using Microsoft.SqlServer.Management.Smo;
 using NDesk.Options;
+using System.Data;
 
 namespace AppHarbor.SqlServerBulkCopy
 {
@@ -152,33 +153,33 @@ namespace AppHarbor.SqlServerBulkCopy
 							exec sp_msforeachtable ""ALTER TABLE ? WITH CHECK CHECK CONSTRAINT all""
 						");
 
-						if (checkIdentityExists)
-						{
-							// http://stackoverflow.com/questions/6542061/reseed-sql-server-identity-columns
-							commandBuilder.Append(
-								@"-- reseed (auto increment to 0) on user tables with identity column
-								DECLARE @reseedSql NVARCHAR(MAX);
-								SET @reseedSql = N'';
-
-								SELECT @reseedSql = @reseedSql + N'DBCC CHECKIDENT(''' 
-									+ QUOTENAME(OBJECT_SCHEMA_NAME(col.[object_id]))
-									+ '.' + QUOTENAME(OBJECT_NAME(col.[object_id])) 
-									+ ''', RESEED, 0);' + CHAR(13) + CHAR(10)
-									FROM sys.columns as col
-									JOIN sys.tables as tbl
-									ON col.[object_id] = tbl.[object_id]
-									WHERE tbl.[type] = 'U'
-									AND col.[is_identity] = 1;
-
-								EXEC sp_executesql @reseedSql;");
-						}
-						else
-						{
-							commandBuilder.Append(@"
-								-- reseed (auto increment to 0)
-								EXEC sp_msforeachtable ""DBCC CHECKIDENT ( '?', RESEED, 0)""
-							");
-						}
+//                        if (checkIdentityExists)
+//                        {
+//                        http://stackoverflow.com/questions/6542061/reseed-sql-server-identity-columns
+//                            commandBuilder.Append(
+//                                @"-- reseed (auto increment to 0) on user tables with identity column
+//								DECLARE @reseedSql NVARCHAR(MAX);
+//								SET @reseedSql = N'';
+//
+//								SELECT @reseedSql = @reseedSql + N'DBCC CHECKIDENT(''' 
+//									+ QUOTENAME(OBJECT_SCHEMA_NAME(col.[object_id]))
+//									+ '.' + QUOTENAME(OBJECT_NAME(col.[object_id])) 
+//									+ ''', RESEED, 0);' + CHAR(13) + CHAR(10)
+//									FROM sys.columns as col
+//									JOIN sys.tables as tbl
+//									ON col.[object_id] = tbl.[object_id]
+//									WHERE tbl.[type] = 'U'
+//									AND col.[is_identity] = 1;
+//
+//								EXEC sp_executesql @reseedSql;");
+//                        }
+//                        else
+//                        {
+//                            commandBuilder.Append(@"
+//								-- reseed (auto increment to 0)
+//								EXEC sp_msforeachtable ""DBCC CHECKIDENT ( '?', RESEED, 0)""
+//							");
+//                        }
 
 						command.CommandText = commandBuilder.ToString();
 
@@ -188,70 +189,98 @@ namespace AppHarbor.SqlServerBulkCopy
 					}
 				}
 			}
-
-			foreach (var table in tables)
-			{
-				using (var connection = new SqlConnection(sourceConnectionString))
-				{
-					double rowBatchSize = 10000;
-					double rows = 0;
-					double dataSize;
-					connection.Open();
-					using (var command = connection.CreateCommand())
-					{
-						command.CommandText = string.Format("exec sp_spaceused '{0}'", table.FullName);
-						using (var reader = command.ExecuteReader())
-						{
-							reader.Read();
-							var rowString = (string)reader["rows"];
-							rows = double.Parse(rowString);
-							var dataSizeString = (string)reader["data"];
-							dataSize = double.Parse(dataSizeString.Split(' ').First()); //kB
-							if (rows > 0 && dataSize > 0)
-							{
-								double rowSize = dataSize / rows;
-								rowBatchSize = (int)(batchDataSize / rowSize);
-							}
-						}
-					}
-
-					if (rows > 0)
-					{
-						var columns = GetColumnNames(connection, table.Schema, table.Name);
-
-						Console.Write("Copying {0} - {1} rows, {2:0.00} MB: ", table.FullName, rows, dataSize/1024);
-						using (var command = connection.CreateCommand())
-						{
-							command.CommandText = string.Format("select * from {0}", table.FullName);
-							using (var reader = command.ExecuteReader())
-							{
-								using (var bulkCopy = new SqlBulkCopy(
-									destinationConnectionString, SqlBulkCopyOptions.KeepIdentity | SqlBulkCopyOptions.TableLock))
-								{
-									bulkCopy.NotifyAfter = Math.Max((int)rows / 10, 1);
-									bulkCopy.SqlRowsCopied += SqlRowsCopied;
-									bulkCopy.DestinationTableName = table.FullName;
-									bulkCopy.BatchSize = (int)rowBatchSize;
-									bulkCopy.BulkCopyTimeout = int.MaxValue;
-									foreach (var columnName in columns) {
-										bulkCopy.ColumnMappings.Add(columnName, columnName);
-									}
-
-									bulkCopy.WriteToServer(reader);
-								}
-							}
-						}
-						Console.WriteLine();
-					}
-					else
-					{
-						Console.WriteLine("{0} had no rows", table.FullName);
-					}
-				}
-			}
+            SetConstraint(destinationConnectionString, false);
+            try
+            {
+                foreach (var table in tables)
+                {
+                    using (var connection = new SqlConnection(sourceConnectionString))
+                    {
+                        connection.Open();
+                        var columns = GetColumnNames(connection, table.Schema, table.Name);
+                        Console.Write("Copying {0} ", table.FullName);
+                        int rows = 0;
+                        using (var command = connection.CreateCommand())
+                        {
+                            command.CommandText = string.Format("select * from {0}", table.FullName);
+                            rows = CopyDataDable(destinationConnectionString, columns, command, table.Name);
+                        }
+                        Console.WriteLine("Write " + rows.ToString() + " rows");
+                    }
+                }
+            }
+            finally
+            {
+                SetConstraint(destinationConnectionString, true);
+            }
 			watch.Stop();
 			Console.WriteLine("Copy complete, total time {0} s", watch.ElapsedMilliseconds/1000);
 		}
+
+        /// <summary>
+        /// 全制約の有効化または無効化を行う
+        /// </summary>
+        /// <param name="destinationConnectionString"></param>
+        /// <param name="bCheck"></param>
+        private static void SetConstraint(string destinationConnectionString, bool bCheck)
+        {
+            var connectionDst = new SqlConnection(destinationConnectionString);
+            connectionDst.Open();
+            try
+            {                							
+                var commandDst = connectionDst.CreateCommand();
+                if (bCheck)
+                {
+                    commandDst.CommandText = "EXEC sp_msforeachtable \"ALTER TABLE ? WITH CHECK CHECK CONSTRAINT all\"";
+                }
+                else
+                {
+                    commandDst.CommandText = "EXEC sp_msforeachtable \"ALTER TABLE ? NOCHECK CONSTRAINT all\"";
+                }
+                commandDst.ExecuteScalar();
+            }
+            finally
+            {
+                connectionDst.Close();
+                connectionDst.Dispose();
+            }
+        }
+        private static int CopyDataDable(string destinationConnectionString, List<string> columns, SqlCommand command, string tableName)
+        {
+            int updateCount = 0;
+            SqlDataAdapter sda = new SqlDataAdapter(command);
+            DataTable dt = new DataTable(tableName);
+            sda.FillSchema(dt, SchemaType.Source);
+            sda.Fill(dt);
+            var connectionDst = new SqlConnection(destinationConnectionString);
+            connectionDst.Open();
+            try
+            {
+                var commandDst = connectionDst.CreateCommand();
+                commandDst.CommandText = string.Format("select * from {0}", tableName);
+                SqlDataAdapter sdaDst = new SqlDataAdapter(commandDst);
+                SqlCommandBuilder builder = new SqlCommandBuilder(sdaDst);
+                DataTable dtDst = new DataTable(tableName);
+                sdaDst.Fill(dtDst);
+                foreach (DataRow dr in dt.Rows)
+                {
+                    DataRow drNew = dtDst.NewRow();
+                    foreach (var c in columns)
+                    {
+                        drNew[c] = dr[c];
+                    }
+                    dtDst.Rows.Add(drNew);
+                    updateCount++;
+                }
+                sdaDst.Update(dtDst);
+            }
+            finally
+            {
+                connectionDst.Close();
+                connectionDst.Dispose();
+            }
+            return updateCount;
+        }
 
 		private static List<string> GetColumnNames(SqlConnection connection, string schemaName, string tableName)
 		{
